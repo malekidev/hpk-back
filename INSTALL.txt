@@ -1,0 +1,106 @@
+APP AND BRIDGE DEPLOYMENT
+
+Requirements: PHP 8.2+, Composer 2, PDO SQLite or MySQL, mbstring, XML/DOM,
+ctype, fileinfo, tokenizer, OpenSSL. The bridge also needs PHP cURL.
+No Node build, worker or development server is required.
+
+Inside tracker-backend:
+  composer install
+  cp .env.example .env
+  php artisan key:generate
+
+Set APP_URL to the HTTPS backend URL, configure DB_* and set a random
+TRACKER_BRIDGE_TOKEN of at least 32 characters. Set FRONTEND_ORIGINS to the
+comma-separated exact HTTPS frontend origins. Never publish .env or tokens.
+For SQLite create the empty database/database.sqlite file first; for production
+prefer a dedicated MySQL database. Then run:
+  php artisan migrate --force
+  php artisan tracker:user OWNER_EMAIL --name="Owner"
+  php artisan tracker:device DEVICE_IMEI OWNER_EMAIL --name="Car" --last-command=22
+  php artisan test
+  php artisan config:cache
+
+Use the actual largest previously used command ID for --last-command, not
+necessarily 22. Defaults to 0 for a fresh device. Do not reset/reuse command IDs.
+An IMEI cannot be claimed through the public API; provisioning requires CLI.
+Serve ONLY tracker-backend/public as the Laravel document root over HTTPS.
+Grant PHP write access to storage, bootstrap/cache, and the SQLite database
+if using SQLite. Do not expose the project root or bridge/storage over HTTP.
+
+BRIDGE ON THE EXISTING HTTP TRACKER HOST
+The current firmware HTTP_HOST is http://hpk.wpdot.online/p? (no slash after p).
+Serve bridge/public/index.php at the exact /p path without a 301 redirect to
+/p/ or HTTPS. Configure an internal rewrite to the bridge script if the host
+would otherwise redirect a directory; do not rely on the modem following 301.
+Copy the bridge directory outside the public document root and expose only
+its entry script with the hosting panel/web-server configuration.
+Set these PHP-FPM/hosting environment variables (not URL parameters):
+  TRACKER_API_URL = the full HTTPS backend address ending /api/tracker/poll
+  TRACKER_BRIDGE_TOKEN = the same random secret configured in Laravel
+The standalone bridge does NOT load Laravel's .env. The variables must be
+available via getenv() on the bridge host. A 503 BRIDGE_NOT_CONFIGURED means
+these values or PHP cURL are missing/invalid.
+The bridge logs validated polls in bridge/storage/logs/tracker-YYYY-MM-DD.jsonl.
+Configure external log retention and disk monitoring. Laravel stores each poll
+and its response in tracker_reports. Optional manual retention:
+  php artisan tracker:prune --days=30
+No pruning schedule is installed automatically.
+
+FRONTEND API
+All request bodies are JSON; send Accept: application/json.
+POST /api/auth/login: email, password, optional token_name
+The returned token is a Bearer token. Keep it out of URLs and logs.
+Send Authorization: Bearer TOKEN on all following requests:
+GET  /api/auth/me
+POST /api/auth/logout (revokes the current token)
+GET  /api/devices (paginated, only owned devices)
+GET  /api/devices/{id}
+PATCH /api/devices/{id}/settings:
+  combined_alert_mode: 0..2
+  acc_alert_mode: 0..2
+  shock_level: 1..8
+  service_enabled: true/false
+All fields are optional individually; at least one is required. Missing fields
+remain unchanged. Null is not accepted. Settings revision increments on change.
+POST /api/devices/{id}/commands:
+  {"action":"L","request_key":"a-new-unique-request-key"}
+Use L for lock and U for unlock. Use a NEW unique request_key per user action;
+reuse the SAME key on HTTP retries. A repeated key never queues another action.
+GET /api/devices/{id}/commands (paginated)
+GET /api/devices/{id}/reports (paginated)
+Command status: queued -> sent -> succeeded/failed. Sent means offered to the
+tracker, NOT successful physical execution. Success reflects firmware RF ACK.
+404 hides devices owned by another user. 401 means missing/expired token.
+422 means invalid input; 409 means a conflicting key or exhausted counter.
+Tokens expire after SANCTUM_EXPIRATION minutes (default seven days).
+
+PROTOCOL AND DELIVERY
+POST /api/tracker/poll is for the authenticated bridge only, not the frontend.
+JSON keys mirror the tracker: i,r,c,a,p,lat,lon. Empty c/a and lat/lon are valid.
+Response is plain text with exactly 8 CSV fields and NO final newline:
+  1,revision,combined_alert_mode,acc_alert_mode,shock_level,service_enabled,id,action
+A c/a report is stored transactionally and receives an empty-command ACK first.
+Repeated reports receive the same safe ACK; the next clean poll can receive
+another command. Unknown historic IDs are logged and acknowledged as well.
+Result a=0 is failure, not an absent result. Lost responses are retried using
+the same command ID. Desired settings are resent until the reported revision
+matches; commands wait for that revision and p=1. The firmware keeps polling
+when GNSS has no fix and sends empty lat/lon. Missing, incomplete or invalid GPS
+is discarded by both bridge and API without rejecting the command or its ACK;
+the last valid position and last_fix_at are preserved. Zero coordinates are valid.
+Power loss (p=0) is separate from GPS loss: settings remain pending until the
+firmware can apply them, and lock/unlock commands are held until power returns.
+A missing backend, invalid CSV or failed logging returns HTTP 503, never a fake
+success ACK. Unregistered IMEIs cannot create devices or fetch commands.
+Queued/sent commands do not expire automatically. Do not queue actions that
+should not run when an offline device reconnects. Counter exhaustion at 65535
+returns 409 rather than silently reusing firmware IDs.
+
+SECURITY LIMIT
+The firmware HTTP link has no per-device signature or encryption. IMEI is an
+identifier, NOT authentication. The bridge token protects the Laravel API but
+cannot authenticate a physical tracker; an attacker who knows an IMEI can
+impersonate polls at the public bridge. Production-grade device identity and
+confidentiality require firmware/protocol changes. Firmware files were not
+modified by this backend project. Do not expose this as a production-grade
+secure vehicle-control service without addressing that limitation.
